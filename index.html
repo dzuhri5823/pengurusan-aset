@@ -228,7 +228,7 @@ const SEED_CATEGORIES = ["ALATAN", "ASET TAK ALIH", "ELEKTRIKAL", "KOMPUTER", "M
    ============================================================ */
 
 /* >>>>>>>> TAMPAL URL WEB APP APPS SCRIPT ANDA DI SINI <<<<<<<< */
-const API_URL = "https://script.googleusercontent.com/macros/echo?user_content_key=AUkAhnR-mDqB0LWAN1xffRIQQEaiIO83yAv1Dy_RDDLeLj_DC93nwqDMXUFcxHsBKNNJGV4wlg54u-HqpLGKmNbZXEuY0J0WucW2khEv46OiVOnjVlvPATRMrcmwQfkKUPPVjFQqCtzHdEwq49FeINSjDgke4yGvDLjKDBcPNod1NHOXAynlcfAu31iMdLzUfjs26F5JAc0SwfVDglvkcUq6BRYOxOXwJN8aw2Vmb9zCN5UUrmSsnhjrW73OeJGWBYscXO5whzMSbeb0EGiIm0_jBdkBl-_CeA&lib=MYwyHm3jQQL2ev9LY8QoQtWQ1aVhVAyEz";
+const API_URL = "PASTE_APPS_SCRIPT_WEB_APP_URL_HERE";
 /* >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> */
 
 const STATUS_LIST = ["MASIH DIGUNAKAN","ROSAK","ROSAK (MASIH DIGUNAKAN)","CADANG LUPUS","LUPUS","DIPINJAM","DIPINDAHKAN","PERLU SEMAKAN"];
@@ -268,17 +268,21 @@ function downloadCSV(filename, headers, rows){
 
 /* ---------------- API client ---------------- */
 async function apiGet(params){
-  const qs = new URLSearchParams(params).toString();
+  const p = Object.assign({}, params);
+  if(STATE.token) p.token = STATE.token;
+  const qs = new URLSearchParams(p).toString();
   const res = await fetch(API_URL + "?" + qs, {method:"GET"});
   const data = await res.json();
   if(data.error) throw new Error(data.message || data.error);
   return data;
 }
 async function apiPost(payload){
+  const body = Object.assign({}, payload);
+  if(STATE.token) body.token = STATE.token;
   const res = await fetch(API_URL, {
     method: "POST",
     headers: {"Content-Type":"text/plain;charset=utf-8"}, // elak preflight CORS pada Apps Script
-    body: JSON.stringify(payload),
+    body: JSON.stringify(body),
   });
   const data = await res.json();
   if(data.error) throw new Error(data.message || data.error);
@@ -292,7 +296,8 @@ COLLECTIONS.forEach(c => DB[c] = []);
 /* ---------------- Global state ---------------- */
 const STATE = {
   user: null,          // {email, name, role}
-  authError: null,     // {reason, email} bila tidak dibenarkan / gagal sambung
+  token: null,
+  authError: null,     // {reason, message} bila log masuk gagal / sesi tamat
   configMissing: false,
   view: "dashboard",
   loading: true,
@@ -330,11 +335,26 @@ function personnelNameById(id){
 async function loadAll(){
   const data = await apiGet({action:"listAll"});
   COLLECTIONS.forEach(c => { if(data[c]) DB[c] = data[c]; });
-  if(data.__caller) STATE.user = {email:data.__caller.email, name:data.__caller.name, role:data.__caller.role};
 }
 async function refreshCollection(name){
   const r = await apiGet({action:"list", collection:name});
   DB[name] = r.data || [];
+}
+
+async function doLogin(email, password){
+  const res = await apiPost({action:"login", email, password});
+  STATE.token = res.token;
+  STATE.user = res.user;
+}
+function doLogout(){
+  STATE.token = null;
+  STATE.user = null;
+  STATE.view = "dashboard";
+  STATE.modal = null;
+  STATE.assetFilter = { q:"", status:"", kategori:"", lokasi:"" };
+  STATE.assetPage = 1;
+  COLLECTIONS.forEach(c => DB[c] = []);
+  render();
 }
 
 async function init(){
@@ -342,35 +362,19 @@ async function init(){
   if(!API_URL || API_URL.indexOf("PASTE_") === 0){
     STATE.configMissing = true; STATE.loading = false; render(); return;
   }
-  try{
-    const who = await apiGet({action:"whoami"});
-    if(!who.authorized){
-      STATE.authError = who; STATE.loading = false; render(); return;
-    }
-    await loadAll();
-    STATE.loading = false;
-    render();
-  }catch(err){
-    STATE.authError = {reason:"CONNECT_FAILED", message: String(err)};
-    STATE.loading = false;
-    render();
-  }
-}
-async function retryInit(){
-  STATE.authError = null;
-  await init();
+  STATE.loading = false;
+  render();
 }
 /* ---------------- Root render ---------------- */
 function render(){
   const root = document.getElementById("app");
   if(STATE.loading){
     root.innerHTML = `<div class="login-wrap"><div class="login-card" style="text-align:center;">
-      <h1>Menyambung ke Google Sheets\u2026</h1><div class="sub">Sila tunggu sebentar</div></div></div>`;
+      <h1>Memuatkan\u2026</h1><div class="sub">Sila tunggu sebentar</div></div></div>`;
     return;
   }
   if(STATE.configMissing){ root.innerHTML = renderConfigMissing(); return; }
-  if(STATE.authError){ root.innerHTML = renderAuthError(); bindAuthErrorEvents(); return; }
-  if(!STATE.user){ root.innerHTML = renderConfigMissing(); return; }
+  if(!STATE.user){ root.innerHTML = renderLogin(); bindLoginEvents(); return; }
   root.innerHTML = renderShell();
   bindShellEvents();
   renderToasts();
@@ -397,32 +401,43 @@ function renderConfigMissing(){
   </div></div>`;
 }
 
-/* ---------------- Auth error (tidak berdaftar / domain salah / gagal sambung) ---------------- */
-function renderAuthError(){
-  const e = STATE.authError;
-  let title = "Tidak Dapat Log Masuk", msg = "";
-  if(e.reason === "NOT_REGISTERED"){
-    title = "Akaun Belum Berdaftar";
-    msg = `Akaun Google anda (<b>${esc(e.email||"tidak dikesan")}</b>) belum didaftarkan dalam sistem ini. Sila hubungi Admin Seksyen Biokimia untuk didaftarkan sebagai pengguna.`;
-  } else if(e.reason === "WRONG_DOMAIN"){
-    title = "Akaun Tidak Dibenarkan";
-    msg = `Sistem ini hanya menerima akaun Google organisasi. Akaun semasa (<b>${esc(e.email||"")}</b>) bukan daripada domain yang dibenarkan.`;
-  } else if(e.reason === "CONNECT_FAILED"){
-    title = "Gagal Berhubung dengan Google Sheets";
-    msg = `Sila pastikan anda log masuk ke akaun Google organisasi dalam pelayar ini, dan sambungan internet stabil. <br/><span class="small muted">${esc(e.message||"")}</span>`;
-  } else {
-    msg = "Sila pastikan anda log masuk ke akaun Google organisasi yang betul dalam pelayar ini.";
-  }
+/* ---------------- Login (e-mel + kata laluan, disahkan oleh Apps Script) ---------------- */
+function renderLogin(){
   return `
-  <div class="login-wrap"><div class="login-card" style="text-align:center;">
-    <h1>${title}</h1>
-    <div class="sub" style="margin-top:10px;line-height:1.6;">${msg}</div>
-    <button class="primary" id="retryBtn" style="margin-top:20px;">Cuba Semula</button>
-  </div></div>`;
+  <div class="login-wrap">
+    <div class="login-card">
+      <h1>Sistem Pengurusan Aset Alih</h1>
+      <div class="sub">Seksyen Biokimia \u2014 Institut Penyelidikan Veterinar, Ipoh</div>
+      <label>E-mel</label>
+      <input type="email" id="loginEmail" placeholder="nama@organisasi.gov.my" autocomplete="username"/>
+      <label>Kata Laluan</label>
+      <input type="password" id="loginPassword" placeholder="Masukkan kata laluan" autocomplete="current-password"/>
+      <button class="primary" id="loginBtn">Log Masuk</button>
+      <div id="loginError"></div>
+    </div>
+  </div>`;
 }
-function bindAuthErrorEvents(){
-  const btn = document.getElementById("retryBtn");
-  if(btn) btn.onclick = ()=> retryInit();
+function bindLoginEvents(){
+  document.getElementById("loginBtn").onclick = handleLoginSubmit;
+  document.getElementById("loginPassword").addEventListener("keydown", e=>{ if(e.key==="Enter") handleLoginSubmit(); });
+}
+async function handleLoginSubmit(){
+  const email = document.getElementById("loginEmail").value.trim();
+  const password = document.getElementById("loginPassword").value;
+  const errEl = document.getElementById("loginError");
+  const btn = document.getElementById("loginBtn");
+  if(!email || !password){ errEl.innerHTML = `<div class="login-err">Sila masukkan e-mel dan kata laluan.</div>`; return; }
+  btn.disabled = true; btn.textContent = "Sedang menyemak\u2026";
+  try{
+    await doLogin(email, password);
+    STATE.loading = true; render();
+    await loadAll();
+    STATE.loading = false;
+    render();
+  }catch(err){
+    errEl.innerHTML = `<div class="login-err">${esc(err.message||"Gagal log masuk.")}</div>`;
+    btn.disabled = false; btn.textContent = "Log Masuk";
+  }
 }
 
 /* ---------------- Shell (sidebar + topbar) ---------------- */
@@ -476,7 +491,10 @@ function renderShell(){
         <b>${esc(STATE.user.name || STATE.user.email)}</b>
         <span class="small">${esc(STATE.user.email)}</span><br/>
         <span class="role-badge role-${STATE.user.role}">${STATE.user.role}</span>
-        <div><button id="refreshBtn">Muat Semula Data</button></div>
+        <div style="display:flex;gap:6px;margin-top:8px;">
+          <button id="refreshBtn">Muat Semula</button>
+          <button id="logoutBtn">Log Keluar</button>
+        </div>
       </div>
     </div>
     <div class="main">
@@ -500,6 +518,7 @@ function bindShellEvents(){
     try{ await loadAll(); toast("Data dikemas kini."); }catch(e){ toast("Gagal muat semula: "+e.message, "err"); }
     render();
   };
+  document.getElementById("logoutBtn").onclick = doLogout;
   document.querySelectorAll("[data-nav]").forEach(el=>{
     el.onclick = ()=>{ STATE.view = el.getAttribute("data-nav"); STATE.modal=null; STATE.sidebarOpen=false; render(); };
   });
@@ -1456,7 +1475,7 @@ function renderSettings(){
   const rows = DB.users;
   const needsImport = DB.assets.length === 0;
   return `
-  <div class="banner">Log masuk sistem ini menggunakan akaun Google organisasi terus (tiada kata laluan berasingan). Untuk membenarkan seseorang menggunakan sistem, tambah alamat e-mel organisasi mereka di bawah dan tetapkan peranan.</div>
+  <div class="banner">Log masuk sistem ini menggunakan e-mel &amp; kata laluan yang diurus terus dalam Google Sheet (tab "users"), disahkan oleh backend Apps Script. Untuk membenarkan seseorang menggunakan sistem, tambah mereka di bawah dan berikan kata laluan awal secara selamat (bukan melalui e-mel/mesej terbuka).</div>
 
   <div class="panel">
     <h2>Import Data Awal</h2>
@@ -1530,7 +1549,11 @@ function renderUserFormModal(id){
       <form id="userForm">
       <div class="form-grid single">
         <div class="field"><label>Nama Penuh <span class="req">*</span></label><input type="text" name="name" value="${esc(rec.name)}" required/></div>
-        <div class="field"><label>E-mel Organisasi <span class="req">*</span></label><input type="email" name="email" value="${esc(rec.email)}" placeholder="nama@jpv.gov.my" required/></div>
+        <div class="field"><label>E-mel (ID Log Masuk) <span class="req">*</span></label><input type="email" name="email" value="${esc(rec.email)}" placeholder="nama@organisasi.gov.my" required/></div>
+        <div class="field"><label>${id?"Tukar Kata Laluan (kosongkan jika tidak mahu tukar)":"Kata Laluan Awal"}${id?"":' <span class="req">*</span>'}</label>
+          <input type="text" name="password" placeholder="${id?'\u2014':'Berikan kata laluan awal'}" ${id?"":"required"}/>
+          <div class="hint">Berikan kata laluan ini kepada pengguna secara selamat (bukan e-mel/mesej terbuka). Mereka boleh memintanya ditukar semula oleh Admin bila-bila masa.</div>
+        </div>
         <div class="field"><label>Peranan</label><select name="role"><option value="ADMIN" ${rec.role==='ADMIN'?'selected':''}>ADMIN</option><option value="USER" ${rec.role==='USER'?'selected':''}>USER</option></select></div>
         <div class="field"><label>Status</label><select name="active"><option value="true" ${rec.active!==false&&rec.active!=="FALSE"&&rec.active!=="Tidak"?'selected':''}>Aktif</option><option value="false" ${rec.active===false||rec.active==="FALSE"||rec.active==="Tidak"?'selected':''}>Tidak Aktif</option></select></div>
       </div>
@@ -1549,7 +1572,10 @@ async function saveUserForm(id){
     name: fd.get("name").trim(), email: fd.get("email").trim().toLowerCase(),
     role: fd.get("role"), active: fd.get("active")==="true",
   };
+  const password = (fd.get("password")||"").trim();
   if(!payload.name || !payload.email){ toast("Sila lengkapkan semua medan.", "err"); return; }
+  if(!id && !password){ toast("Sila berikan kata laluan awal.", "err"); return; }
+  if(password) payload.password = password;
   const saveBtn = document.getElementById("userFormSave");
   if(saveBtn){ saveBtn.disabled = true; saveBtn.textContent = "Menyimpan\u2026"; }
   try{
